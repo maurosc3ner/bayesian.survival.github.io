@@ -1,0 +1,709 @@
+---
+title: "Bayesian Workflow for Survival Analysis of Recurrent Events"
+output: 
+#  github_document:  
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+always_allow_html: true
+date: "2023-11-10"
+authors: Esteban Correa-Agudelo and Tesfaye B. Mersha
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE, message = FALSE) 
+
+rm(list=ls())
+library(rstanarm)
+library(survival)
+library(tidyverse)
+library(patchwork)
+library(bayesplot)
+library(loo)
+library(gtsummary)
+library(data.table)
+source("survival_ttr_example_files/helpers.r")
+```
+
+# Introduction
+
+Tutorials in survival models for recurrent events are scarce with limited content on the whole workflow using Bayesian inference in R. Hence, I developed a Bayesian workflow for survival analysis, covering model specification, priors, visualization, validation and even deployment in Shiny.
+
+This tutorial extends Brilleman et al.,[1] vignettes to recurrent events scenario. Regression models were developed in R using survival, rstanarm, and ggplot packages. Bayesian inference used Hamiltonian Monte Carlo No-U-Turn Sampler (NUTS) with 10 chains, 2000 iterations (50% warmup, 50% inference) and 10 degrees of freedom $(\delta=10)$ in the hazard function.
+
+Briefly, survival Analysis is a branch of statistics that deals with analyzing the expected duration of time until one or more events happen. These events could be death in placebo vs treatment trial, mechanical failure in engines, or departure in customer churn analysis. 
+The name "Survival Analysis" might sound a bit grim, but it's not always about life and death. It's about understanding the 'lifespan' of a subject in a system. For example, it can be used to predict when a machine part might fail, or how long a user might stay subscribed to a service.
+Here are some key points to understand about Survival Analysis:
+**Censoring:** One of the unique aspects of Survival Analysis is its ability to handle 'censoring'. Censoring occurs when we have incomplete information about the time of the event. For example, if we are studying the lifespan of a group of people, some of them might still be alive at the end of the study. Their exact lifespans are unknown or 'censored', but Survival Analysis can still use this information.
+**Survival Function:** This function estimates the probability that a subject survives longer than a certain amount of time.
+**Hazard Function:** This function estimates the probability that an event occurs at a certain time, given that the subject has survived up to that time.
+**Applications:** Survival Analysis has wide applications in various fields such as medical research, engineering, economics, social sciences, and even customer analytics in business.
+
+Remember, the goal of Survival Analysis is not just to predict when an event will happen, but to understand the underlying factors that influence the timing of the event. It's a powerful tool in the statistician's toolbox, helping us make sense of the complex, uncertain world around us.
+
+```{r cars}
+data<-cgd0
+cgd0[1:4,]
+```
+
+# Building time-dependent sets with tmerge
+
+Data are from the famous controlled trial in chronic granulotomous disease (CGD). It contains 203 observations on time to serious infections observed through end of study for each patient. Recurrent events and covariates for each patient were encoded as time intervals between events. [2] For example, patient 1 was followed for 60 days and had infection events on days 1, 24 and 37, patient 2 had 7 events and patient 3 had one event on day one, and all patients were censored on day 439.
+
+```{r}
+data2<-tmerge(
+  cgd0[, 1:13],
+  cgd0,
+  id = id,
+  tstop = futime,
+  infect = event(etime1),
+  infect = event(etime2),
+  infect = event(etime3),
+  infect = event(etime4),
+  infect = event(etime5),
+  infect = event(etime6),
+  infect = event(etime7)
+)
+
+data2 <- tmerge(data2, data2, id= id, enum = cumtdc(tstart))
+```
+
+## COX Proportional Hazard
+
+```{r}
+f.null<-formula(Surv(tstart, tstop, infect) ~ 1.0)
+f.full<-formula(Surv(tstart, tstop, infect) ~ treat + inherit + steroids)
+```
+
+```{r pressure, echo=FALSE}
+m.cox.null<-coxph(f.null, data =data2, cluster = id)
+m.cox.full<-coxph(f.full, data =data2, cluster = id)
+
+summary(m.cox.full)
+
+AIC(m.cox.null,m.cox.full)
+```
+
+# Bayes Inference
+
+Probability for infection event was calculated under a Bayesian survival analysis framework using a spline-based (M-spline) hazard regression model. [2] The M-Spline hazard function is defined as: $$
+\begin{aligned}
+  h(i)=\sum_{l=1}^{L} \gamma_{l}M_{l}(t;k;\delta)exp(\eta_{i}(t))\\
+\end{aligned}
+$$ Where $h_i(t)$ is the hazard of the event for individual i with $\eta_{i}$ time-dependent predictors at time $t$. $l^{th} (l=1,…,L)$ denotes the basis term for a degree $\delta$ M-spline function evaluated at a vector of knot locations $k=\{ k_1,…,k_J \}$ and $\gamma_l$ denotes the $l^{th}$ M-spline coefficient. For our example, we estimated hazard ratios (HRs) and survival probability curves between treated and untreated patients.
+
+We start with no prior knowledge (default):
+
+```{r}
+# when chains>1 r makes use of viewer
+CHAINS <- 10
+CORES <- 10
+ITER <- 2000
+SEED <- 42
+# draw from the prior predictive distribution of the stan_surv survival model
+prior.stan.cgd <- stan_surv(
+  formula = f.full,
+  data = data2,
+  basehaz = "exp",
+  prior_PD = TRUE,
+  chains = CHAINS,
+  cores = CORES,
+  iter = ITER,refresh=2000,
+  seed = SEED)
+```
+
+Let's use more appropriate priors:
+
+```{r}
+prior.stan.cgd2 <- update(prior.stan.cgd,
+                            prior_intercept = normal(0, 1),
+                            prior = normal(0, .5))
+print(prior.stan.cgd2, digits = 3)
+#Compare them
+mcmc_intervals(prior.stan.cgd)
+mcmc_intervals(prior.stan.cgd2)
+```
+
+## Sampling exp+mspline
+
+```{r}
+# Null
+fit.stan.cgd.exp.f.null <- update(prior.stan.cgd2,  
+                             prior_PD = FALSE,
+                             formula=f.null,
+                             basehaz = "exp")
+# cubic m-spline tstart2, tstop2
+fit.stan.cgd.ms10.f.null <- update(fit.stan.cgd.exp.f.null,
+                        basehaz = "ms",
+                        basehaz_ops = list(df = 10))
+# Full
+fit.stan.cgd.exp.f.full <- update(prior.stan.cgd2,  
+                             prior_PD = FALSE,
+                             formula=f.full,
+                             basehaz = "exp")
+fit.stan.cgd.ms10.f.full <- update(fit.stan.cgd.exp.f.full,
+                        basehaz = "ms",
+                        basehaz_ops = list(df = 10))
+fits_stan <- list("exp.f.null" = fit.stan.cgd.exp.f.null,
+                  "exp.f.full" = fit.stan.cgd.exp.f.full,
+                  "ms10.f.null" = fit.stan.cgd.ms10.f.null,
+                  "ms10.f.full" = fit.stan.cgd.ms10.f.full
+
+                  )
+print(fit.stan.cgd.exp.f.full, digits = 3)
+print(fit.stan.cgd.ms10.f.full, digits = 3)
+```
+
+Further information on calculating the hazard curve and the RMST can be found in [3-6].
+
+## Posterior uncertainty intervals
+
+```{r}
+m.cox.full%>%
+  tbl_regression(exponentiate = T)
+
+mcmc_post_ci(fit.stan.cgd.exp.f.full,.95,4)
+
+mcmc_post_ci(fit.stan.cgd.ms10.f.full,.95,4)
+```
+
+## Hazard curves
+
+```{r}
+plots <- map(fits_stan,plot)
+
+a<-plots[[2]]+
+  labs(title = "Constant (exp)")+
+  coord_cartesian(ylim = c(0,.1))+
+  theme(plot.title = element_text(hjust = .5))
+
+b<-plots[[4]]+labs(title = "M-splines  (df=10)")+
+  coord_cartesian(ylim = c(0,.1))+
+  theme(plot.title = element_text(hjust = .5))
+a+b
+```
+
+## Survival curves: COX PH vs Bayes
+
+```{r}
+data_test <- data.frame(
+  id = 1:2,
+  treat = c(0, 1),
+  inherit = c(1, 1),
+  steroids = c(1, 1)
+)
+ndraws=1000
+
+##### Constant (exponential) 
+psb<-posterior_survfit(fit.stan.cgd.exp.f.full,
+                      newdata = data_test,
+                      times = 0,
+                      extrapolate   = T, 
+                      condition     = FALSE,
+                      return_matrix = F,
+                      control = list(edist = 439),
+                      draws = ndraws)
+
+psb<-psb %>% 
+  left_join(data_test,by="id")
+#tidybayes does  not work with posterior_survfit yet
+b<-psb %>% as_tibble()%>%
+  ggplot(aes(x=time,y=median,col=factor(treat),fill=factor(treat))) +
+  # scale_x_continuous(breaks=c(50,100,150,200,250,300,350,400,439))+
+  geom_ribbon(aes(ymin = ci_lb, ymax = ci_ub),size=0.1,alpha=0.1) +
+  geom_line()+labs(x="Time (days)",y="",subtitle="Bayesian constant",col="Treatment",fill="Treatment")+
+  theme_minimal()+theme(legend.position = "none")
+# +add_knots(fit.stan.ms10)
+####M-spline
+psc<-posterior_survfit(fit.stan.cgd.ms10.f.full,
+                      newdata = data_test,
+                      times = 0,
+                      extrapolate   = T, 
+                      condition     = FALSE,
+                      return_matrix = F,
+                      control = list(edist = 439),
+                      draws = ndraws)
+
+psc<-psc %>% 
+  left_join(data_test,by="id")
+#tidybayes does  not work with posterior_survfit yet
+c<-psc %>% as_tibble()%>%
+  ggplot(aes(x=time,y=median,col=factor(treat),fill=factor(treat))) +
+  # scale_x_continuous(breaks=c(50,100,150,200,250,300,350,400,439))+
+  geom_ribbon(aes(ymin = ci_lb, ymax = ci_ub),size=0.1,alpha=0.1) +
+  geom_line()+labs(x="Time (days)",y="",subtitle="Bayesian M-spline",col="Treatment",fill="Treatment")+
+  theme_minimal()+theme(legend.position = "none")
+# +add_knots(fit.stan.ms10)
+
+#Lets compare with cox
+ps2<-survfit(m.cox.full, newdata = data_test)
+ps2cox<-data.frame(time=rep(ps2$time,2),
+                   median=c(ps2$surv[,1],ps2$surv[,2]),
+                   ci_lb=c(ps2$lower[,1],ps2$lower[,2]),
+                   ci_ub=c(ps2$upper[,1],ps2$upper[,2]),
+                   treat = rep(c(0, 1),each=length(ps2$time)),
+                   inherit = 1,
+                   steroids = 1
+                   )
+a<-ps2cox %>%
+  ggplot(aes(x=time,y=median,col=factor(treat),fill=factor(treat))) +
+  geom_ribbon(aes(ymin = ci_lb, ymax = ci_ub),size=0.1,alpha=0.1) +
+  geom_line()+labs(x="Time (days)",y="Probability of Survival Free\n of Infection",subtitle="COX PH",col="Treatment",fill="Treatment")+
+  theme_minimal()+theme(legend.position = "bottom")
+
+legend = get_legend(a)
+a<-a+theme(legend.position = "none")
+
+(a+b+c)/(plot_spacer()+legend+plot_spacer())
+```
+
+## Beautiful survival curves in Bayes
+
+For publishing purposes, survival plots require additional tweaking in ggplot. I have taken inspiration from survminer package that makes a wonderful paper-like plots for cox ph models.[7] Let's do the same but for our rstanarm model:
+
+```{r}
+annoTextS=4
+cbPalette <- c("#4DBBD5","#E64B35")
+grid <- seq(0,439,by=100)
+
+data_test <- data.frame(
+  id = 1:2,
+  treat = c(0, 1),
+  inherit = c(1, 1),
+  steroids = c(1, 1)
+) %>%
+  mutate(Strata =ifelse(treat==0, "Untreated", "Treated"))
+ndraws=1000
+# already collapsed
+ps<-posterior_survfit(fit.stan.cgd.ms10.f.full,
+                      newdata = data_test,
+                      times = 0,
+                      extrapolate   = T, 
+                      condition     = FALSE,
+                      return_matrix = F,
+                      control = list(edist = 439),
+                      draws = ndraws)
+ps<-ps %>% 
+  left_join(data_test,by="id")
+# prepare HR annotations
+text.df<-data.frame(
+  x=c(0),
+  y=c(0.05),
+  label=c("HR Treated=0.44 (0.28 to 0.67)")
+)
+################ survival curves
+a<-ps %>%as_tibble()%>%
+  ggplot(aes(x=time,y=median,col=Strata)) +
+  geom_ribbon(aes(ymin = ci_lb, ymax = ci_ub,fill=Strata), 
+              # fill = "gray90",
+              alpha=0.2,
+              size=0.0) +
+  geom_line()+
+  scale_color_manual(values=cbPalette)+
+  scale_fill_manual(values = cbPalette)+
+  scale_x_continuous(breaks = grid)+
+  labs(x="",y="Probability of Survival Free\n of Infection",col="Strata")+
+  survminer::theme_survminer(base_family = "Times New Roman")
+a<-a+annotate(geom="text",x=text.df$x,y=text.df$y,label=text.df$label,
+           size=annoTextS,
+           hjust=0,family="Times New Roman")+
+  theme(legend.position = "right",
+        text=element_text(family="Times New Roman"),
+        plot.margin = unit(c(0,0,0,0), "cm"))
+#obtain legend object
+legend = get_legend(a)
+# a<-a+theme(legend.position = "none")
+################ Risk table as ggplot element
+datatr <- fit.stan.cgd.ms10.f.full$data %>% ungroup() %>%
+  mutate(Strata = factor(
+    ifelse(treat==0, "Untreated", "Treated")
+  ))
+summary(datatr$Strata)
+patients<-datatr %>% 
+  group_by(id) %>% 
+  arrange(tstart) %>% 
+  slice_head()
+riskcounts.df<-rbind(
+  RiskSetCount(grid,patients,strataoi ="Untreated"),
+  RiskSetCount(grid,patients,strataoi ="Treated")
+    )
+
+tabrisk<-ggplot(riskcounts.df, aes(x = time,y = factor(strata),
+  label = as.character(value)
+  ))  +
+  geom_text(size = 4,family = "Times New Roman")+
+  coord_cartesian(xlim = c(0,439))+
+  scale_x_continuous(breaks=grid)+
+  scale_y_discrete(limits=rev(c(
+    "Untreated",
+    "Treated"
+  )),labels=c("",""))+
+  labs(x="Time (months)",y="Strata",subtitle = "Number at risk")+
+  survminer::theme_survminer(base_family = "Times New Roman")+
+  theme(legend.position = "none",
+        text = element_text(family = "Times New Roman"),
+        axis.text.y = element_text( hjust = 1 ),
+        axis.ticks.y = element_line(size  = 2,colour = rev(cbPalette)),
+        axis.ticks.length.y = unit(15, "pt"),
+        plot.margin = unit(c(0,0,0,0), "cm"))
+
+(a<-a / tabrisk+plot_layout(ncol=1,heights = c(3,1)))
+```
+
+## Time to recurrence infections
+
+Complementary to HR, we quantify time to recurrence (TTR) using the difference in the Restricted Mean Survival Time (RMST). Clinically, RMST is defined as the average event-free survival time among a population up to a fixed clinically important follow-up time $(\tau)$. [5-6] It is estimated using the area under the curve between start of the follow-up $(t=0)$ and a particular time horizon ($t=\tau$). The RMST is denoted by $\rho(\tau)$ and approximated using a $15$-points Gauss-Kronrod quadrature as:
+
+$$
+\begin{aligned}
+\rho(\tau)\approx\frac{\tau}{2}\sum_{i=1}^{15}w_{i}S(\frac{\tau}{2}+\frac{\tau}{2}\chi_i)\\
+\end{aligned}
+$$
+
+```{r}
+tau <- c(180, 365)
+
+rmst.trt <-
+  map(tau,
+      ~ rmst_check_plot(
+        fit.stan.cgd.ms10.f.full,
+        data_test,
+        tau = .
+      ))
+#number of digits for the table
+ndig=1
+
+rmst.table={}
+for(i in 1:length(tau)) {
+  treated=paste0(
+    round(median(rmst.trt[[i]][[1]]$rmstA),ndig),
+    " (",
+    round(quantile(rmst.trt[[i]][[1]]$rmstA,prob=c(0.025)),ndig),
+    " to ",
+    round(quantile(rmst.trt[[i]][[1]]$rmstA,prob=c(0.975)),ndig),
+    ")"
+  )
+  notreated=paste0(
+    round(median(rmst.trt[[i]][[1]]$rmstB),ndig),
+    " (",
+    round(quantile(rmst.trt[[i]][[1]]$rmstB,prob=c(0.025)),ndig),
+    " to ",
+    round(quantile(rmst.trt[[i]][[1]]$rmstB,prob=c(0.975)),ndig),
+    ")"
+  )
+  diff=paste0(
+    round(median(rmst.trt[[i]][[1]]$diffA_B),ndig),
+    " (",
+    round(quantile(rmst.trt[[i]][[1]]$diffA_B,prob=c(0.025)),ndig),
+    " to ",
+    round(quantile(rmst.trt[[i]][[1]]$diffA_B,prob=c(0.975)),ndig),
+    ")"
+  )
+  obs=data.frame(tau=tau[i],
+                   RMST.A=treated,
+                 RMST.B=notreated,
+                 RMST.diff=diff
+                 )
+  rmst.table<-rbind(rmst.table,obs)
+}
+rmst.table%>% 
+  kableExtra::kbl() %>% 
+  kableExtra::kable_paper("hover",full_width=F) 
+
+# join all 3 measures
+rmst.trt.gg<-rbind(
+    rmst.trt[[1]][[1]],
+    rmst.trt[[2]][[1]]
+    )
+rmst.trt.gg$tau<-factor(as.character(rmst.trt.gg$tau),levels=c("180","365"))
+# wide to long for easy manipulation
+rmst.trt.gg<-gather(rmst.trt.gg,condition,time,rmstA:ratioA_B)
+
+a<-ggplot() +
+  geom_point(
+    data = rmst.trt.gg %>% filter(condition %in% c("rmstA", "rmstB")),
+    aes(x = tau, y = time, group = condition,col=condition),
+    position = "jitter",
+    alpha = 0.05,
+    size = 0.01
+  ) +
+  scale_color_manual(values = c("red", "blue"),labels=c("No","Yes"))+
+  geom_boxplot()+
+  stat_summary(
+               fun=mean,
+               geom="line"
+               )+
+  labs(y = "Time-free of infection",col="Treatment") + 
+  guides(colour = guide_legend(override.aes = list(size=10)))+
+  theme_bw()
+a
+
+bayesplot_grid(
+    a,
+    rmst.trt[[1]]$p3,
+    rmst.trt[[2]]$p3,
+    # rmst.ar[[3]]$p3,
+    grid_args = list(ncol = 2),
+    # titles = paste0("RMST (tau=", tau, ")"),
+    # subtitles = rep("with medians and 95% CI", 4)
+    subtitles = c("Time-free evolution","Tau=180","Tau=365")
+    )
+```
+
+On average, treated patients had a median of 20 and 67 additional days free of infection compared to non-treated patients, at 6 months and 1-year of follow-up.
+
+# Validation
+
+To assess the fit of the regression models, we performed model comparison (M-Spline vs baseline exponential hazard) at different levels.
+
+-   At computational level (MCMC mixing).
+
+-   At hazard ratios level comparing estimates VS posteriors.
+
+-   At prediction level (LOGO, WAIC and C-Index.
+
+## MCMC
+
+Are chains mixing well?
+
+```{r}
+color_scheme_set("mix-blue-red")
+mcmc_trace(fit.stan.cgd.ms10.f.full, 
+           pars=c("treat", "(Intercept)"),
+           facet_args = list(ncol = 1, strip.position = "left")
+           )
+```
+
+## Checking hazard ratios (Estimates VS Posteriors)
+
+How far is our distribution compared to the cox's estimate? Comparing the three models, we can see M-spline-based is closer to the cox estimate.
+
+```{r}
+# extract HR from classical coxph for arm=B
+exp(coef(m.cox.full))[1]
+base_cox_hr <- vline_at(exp(coef(m.cox.full))[1], color = "green")
+
+a<-mcmc_hist(prior.stan.cgd2,
+             pars = c("treat"),
+             transformations = exp,
+             binwidth = 0.001) + base_cox_hr+labs(subtitle="Priors")
+
+b<-mcmc_hist(fit.stan.cgd.exp.f.full,
+             pars = c("treat"),
+             transformations = exp,
+             binwidth = 0.001) + base_cox_hr+labs(subtitle = "Posterior (const)")
+c<-mcmc_hist(fit.stan.cgd.ms10.f.full,
+             pars = c("treat"),
+             transformations = exp,
+             binwidth = 0.001) + base_cox_hr+labs(subtitle = "Posterior (ms-10)")
+
+a+b+c
+```
+
+## LOGO and WAIC
+
+Goodness of fit is examined by using a leave-one-out cross validation based on the expected log predictive density (elpd). According to Gelman et al.,[8] the lower the elpd score the better the model fit is. A leave-one-out is used to avoid over optimistic due to overfitting. We assume "leaving-out" an individual rather than an observation for both goodness of fit and calibration schemes.
+
+```{r}
+post <- as.array(fit.stan.cgd.ms10.f.full) 
+ids<-fit.stan.cgd.exp.f.full$data$id
+chain_id=rep(1:dim(post)[2], each = dim(post)[1])
+#### model exp null
+#1. Get log likehood per infection event
+myllk.exp.f.null<-log_lik(fit.stan.cgd.exp.f.null,merge_chains = F)
+#2. Join llk by patient 
+myllk2.exp.f.null<-llkByPatient(llk = myllk.exp.f.null,ids = ids)
+# 3. Effective samples
+reff.exp.f.null<-relative_eff(myllk2.exp.f.null,chain_id = chain_id,cores = 10)
+
+#### model exp full
+#1. Get log likehood per infection event
+myllk.exp.f.full<-log_lik(fit.stan.cgd.exp.f.full,merge_chains = F)
+#2. Join llk by patient 
+myllk2.exp.f.full<-llkByPatient(llk = myllk.exp.f.full,ids = ids)
+# 3. Effective samples
+reff.exp.f.full<-relative_eff(myllk2.exp.f.full,chain_id = chain_id,cores = 10)
+
+#model ms10 null
+myllk.ms10.f.null<-log_lik(fit.stan.cgd.ms10.f.null)
+myllk2.ms10.f.null<-llkByPatient(llk = myllk.ms10.f.null,ids = ids)
+reff.ms10.f.null<-relative_eff(myllk2.ms10.f.null,chain_id = chain_id,cores = 10)
+
+#model ms10 full
+myllk.ms10.f.full<-log_lik(fit.stan.cgd.ms10.f.full)
+myllk2.ms10.f.full<-llkByPatient(llk = myllk.ms10.f.full,ids = ids)
+reff.ms10.f.full<-relative_eff(myllk2.ms10.f.full,chain_id = chain_id,cores = 10)
+
+# Versus frequentist approaches
+AIC(m.cox.null,m.cox.full)
+
+#leave-one-out ELPD
+compare(
+  loo(myllk2.exp.f.null, r_eff = reff.exp.f.null),
+  loo(myllk2.exp.f.full, r_eff = reff.exp.f.full),
+  loo(myllk2.ms10.f.null, r_eff = reff.ms10.f.null),
+  loo(myllk2.ms10.f.full, r_eff = reff.ms10.f.full)
+)%>% 
+  kableExtra::kbl() %>% 
+  kableExtra::kable_paper("hover",full_width=F) 
+
+#leave-one-out WAIC
+compare(
+  waic(myllk2.exp.f.null, r_eff = reff.exp.f.null),
+  waic(myllk2.exp.f.full, r_eff = reff.exp.f.full),
+  waic(myllk2.ms10.f.null, r_eff = reff.ms10.f.null),
+  waic(myllk2.ms10.f.full, r_eff = reff.ms10.f.full)
+)%>% 
+  kableExtra::kbl() %>% 
+  kableExtra::kable_paper("hover",full_width=F) 
+
+```
+
+In both, null and full scenarios, elpd is better in M-splines alternatives, of course full model is better than null as expected.
+
+## Harrel C-Index
+
+We can also make use of Harrel C-index (also known as concordance index).[9] Let's focus only on full models for the concordance metric.
+
+```{r}
+ndraws=1000
+data_test<-fit.stan.cgd.exp.f.full$data
+data_test$coxlp.f.full<-predict(m.cox.full,newdata = data_test,"lp")
+data_test$coxsurv.f.full<-predict(m.cox.full,newdata = data_test,"survival")
+
+#loghaz refers to lp in bayes
+data_test$explp.f.full<-posterior_survfit(fit.stan.cgd.exp.f.full,
+                      newdata = data_test,
+                      extrapolate = F,
+                      type="loghaz",
+                      draws = ndraws,return_matrix = F,
+                      times       = "tstart",
+                      last_time   = "tstop")$median
+data_test$expsurv.f.full<-posterior_survfit(fit.stan.cgd.exp.f.full,
+                      newdata = data_test,
+                      extrapolate = F,
+                      type="surv",
+                      draws = ndraws,return_matrix = F,
+                      times       = "tstart",
+                      last_time   = "tstop")$median
+#M-splines
+data_test$ms10lp.f.full<-posterior_survfit(fit.stan.cgd.ms10.f.full,
+                      newdata = data_test,
+                      extrapolate = F,
+                      type="loghaz",
+                      draws = ndraws,return_matrix = F,
+                      times       = "tstart",
+                      last_time   = "tstop")$median
+data_test$ms10surv.f.full<-posterior_survfit(fit.stan.cgd.ms10.f.full,
+                      newdata = data_test,
+                      extrapolate = F,
+                      type="surv",
+                      draws = ndraws,return_matrix = F,
+                      times       = "tstart",
+                      last_time   = "tstop")$median
+# Pairs
+pairs(~coxlp.f.full+explp.f.full+ms10lp.f.full, data_test,
+      upper.panel = panel.cor,    # Correlation panel
+      lower.panel = panel.smooth)
+
+pairs(~coxsurv.f.full+expsurv.f.full+ms10surv.f.full, data_test,
+      upper.panel = panel.cor,    # Correlation panel
+      lower.panel = panel.smooth)
+```
+
+Graphically, we observe some correlation between cox and bayesian predictions. Let's estimate C-index for our predictions
+
+```{r}
+y_test <- Surv(data_test$tstart,
+               data_test$tstop,
+               data_test$infect)
+
+# cindex for linear predictor (log hazard)
+concordance(y_test~data_test$coxlp.f.full,reverse = T) #it works with risk
+concordance(y_test~data_test$explp.f.full,data = data_test,reverse = T)
+concordance(y_test~data_test$ms10lp.f.full,data = data_test,reverse = T)
+```
+
+## Calibration plots
+
+How far are our predicted versus observed predictions?
+
+```{r}
+#fixed time
+times = as.double(seq(5, 439, 100))
+
+summary(data_test$tstart)
+#most common time slots
+times2<-data_test %>% 
+  dplyr::filter(tstart>0.0) %>% 
+  mutate(ints = cut(tstart ,
+                    breaks = seq(0, 439, 100),
+                    include.lowest = FALSE,
+                    right = FALSE)) %>% 
+  dplyr::group_by(ints,tstart) %>% 
+  dplyr::summarise(myn=n()) %>%  
+  slice_max(myn, with_ties = F)
+times2
+times2<-times2%>% 
+  pull(tstart) 
+times
+(times<-times2)
+
+y_test.f.full <- filter(data_test, tstart %in% times) %>% 
+  ungroup() %>% 
+  select(c("tstart","tstop","infect")) 
+
+```
+
+```{r}
+res<-calibrate(data = data_test,times = times,y = y_test.f.full,
+               tstart_col = "tstart",tstop_col ="tstop",status_col = "infect",
+               n_groups = 10,surv_col = "coxsurv.f.full" )
+autoplot(res)+labs(subtitle = "Cox PH")
+
+res<-calibrate(data = data_test,times = times,y = y_test.f.full,
+               tstart_col = "tstart",tstop_col ="tstop",status_col = "infect",
+               n_groups = 10,surv_col = "expsurv.f.full" )
+
+autoplot(res)+labs(subtitle = "Constant (exp)")
+
+res<-calibrate(data = data_test,times = times,y = y_test.f.full,
+               tstart_col = "tstart",tstop_col ="tstop",status_col = "infect",
+               n_groups = 10,surv_col = "ms10surv.f.full" )
+
+autoplot(res)+labs(subtitle = "M-spline")
+```
+
+We obtain mixed results in the validation part for all approaches, reasons are manifold. Survival analysis is hard, specially in very tricky datasets (recurrent visits). I suggest you select model based on a combination of more than one validation technique (HR + elpd, HR + C-Index). Also, I suggest evidence-driven covariate-selection with additional caution on non-normal covariates.
+
+# Deploying your survival model
+
+After the sufficient validation with internal and external datasets, you can make your model available to more people in your research/clinical organization by using Shiny. Shiny is a reactive...
+
+```{r}
+sessionInfo()
+```
+
+# References and resources
+
+1.  Brilleman SL, Elçi EM, Novik JB, Wolfe R. Bayesian Survival Analysis Using the rstanarm R Package. 2020. arXiv preprint. arXiv:2002.09633. URL: [[https://arxiv.org/abs/2002.09633.](https://arxiv.org/abs/2002.09633)](https://arxiv.org/abs/2002.09633.%5D(https://arxiv.org/abs/2002.09633)) Accessed July 1, 2022.
+
+2.  Fleming and Harrington, Counting Processes and Survival Analysis, appendix D.2.
+
+3.  Therneau, T., Crowson, C., and Atkinson E. "Using Time Dependent Covariates and Time Dependent Coefficients in the Cox Model". Survival Vignettes. Accessed May 1, 2023.
+
+4.  Therneau T (2023). A Package for Survival Analysis in R. R package version 3.5-5, <https://CRAN.R-project.org/package=survival>.
+
+5.  Ramsay, J. O. 1988. "Monotone Regression Splines in Action." Statistical Science 3 (4): 425--41. [https: //doi.org/10.1214/ss/1177012761](https:%20//doi.org/10.1214/ss/1177012761) Accessed July 1, 2022.
+
+6.  Royston, Patrick, and Mahesh KB Parmar. 2013. "Restricted Mean Survival Time: An Alternative to the Hazard Ratio for the Design and Analysis of Randomized Trials with a Time-to-Event Outcome." BMC Medical Research Methodology 13 (1): 152.
+
+7.  Kassambara A, Kosinski M, Biecek P (2021). *survminer: Drawing Survival Curves using 'ggplot2'*. R package version 0.4.9, <https://CRAN.R-project.org/package=survminer>.
+
+8.  Vehtari A, Gelman A, Gabry J. Practical Bayesian model evaluation using leave-one-out cross-validation and WAIC. Statistics and Computing. 2017/09/01 2017;27(5):1413-1432. <doi:10.1007/s11222-016-9696-4>
+
+9.  Harrell F.E Jr., Lee K.L., Mark D.B., "Multivariable prognostic models: issues in developing models, evaluating assumptions and adequacy, and measuring and reducing errors", Statistics in Medicine, 15(4), 361--87, 1996.
